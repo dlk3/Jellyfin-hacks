@@ -1,0 +1,267 @@
+#!/usr/bin/env python
+
+#********************************************************************************
+#  Copyright (C) 2021  David King <dave@daveking.com>
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#********************************************************************************
+#  Search XMLTV program listings for keywords in program titles, subtitles,
+#  descriptions, and cast/crew lists.  Ask Jellyfin to record those programs
+#  that match.
+#
+#  This script only works in environments where XMLTV is being used as the TV
+#  guide data provider for Jellyfin.
+#********************************************************************************
+
+import logging
+import os
+
+#********************************************************************************
+#                          C o n f i g u r a t i o n                            *
+#********************************************************************************
+
+#  A search string can be any regular expression that works inside re.compile().
+#  See https://docs.python.org/3/library/re.html for details.
+#  Case is always ignored for these searches. 
+searches = [
+	'Stevie Ray Vaughan',           #  Match this 
+	'(?=.*Anthony)(?=.*Bourdain)(?!.*No Reservations)',  #  Match first and last names in a string, in any order, as long as the string does not contain "No Reservations"
+	'(?=.*David)(?=.*Attenborough)',
+	'(?=.*Jeremy)(?=.*Clarkson)'
+]
+
+#  Scheduling recordings requires Jellyfin user authentication, api-key authentication isn't sufficient
+server_url = 'http://localhost:8096/emby'
+userid = 'YOUR_JELLYFIN_USERID'
+passwd = 'YOUR_JELLYFIN_PASSWORD'
+#  WARNING: These values are sent in the clear.  Either run this script locally on the
+#  Jellyfin server or use an HTTPS URL to connect to the Jellyfin server.
+
+#  Directory into which we will write our log file
+logdir = '/var/log/jellyfin'
+
+#  Control the level of detail that is logged
+log_level = logging.INFO	#  Can be logging.DEBUG, logging.INFO or logging.CRITICAL
+
+#  Use this line to log to the console
+#logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=log_level)
+
+#  Use these lines to log to a file
+logfile = '{}.log'.format(os.path.join(logdir, os.path.splitext(os.path.basename(__file__))[0]))
+logging.basicConfig(filename=logfile, format='%(asctime)s %(levelname)s: %(message)s', level=log_level)
+
+#  File where we can find the latest output from the XMLTV grabber
+xmltv_file  = '/opt/xmltv/xmltv_output.xml'
+
+#********************************************************************************
+#                               F u n c t i o n s                               *
+#********************************************************************************
+
+import datetime
+import xml.etree.ElementTree as etree
+import requests
+import tempfile
+import hashlib
+import json
+import re
+
+#  Once a program has been found in the XMLTV schedule that matches one of the
+#  regular expressions above, this routine will try to schedule that program to
+#  be recorded by Jellyfin.  It maps the channel id string used by XMLTV to a
+#  Jellyfin channel id string, via the actual channel number.  It checks to see
+#  if Jellyfin already has the program in its recordings collection or a timer
+#  is already set for the program before it submits a request to create a timer.
+def recordProgramme(root, channel_list, program_guide, programme):
+	#  If the start time is in the future, record the program.  
+	#  Jellyfin and XMLTV times are UTC.
+	startdate = programme.attrib['start']
+	startdate = '{}-{}-{}T{}:{}:{}.0000000Z'.format(startdate[0:4], startdate[4:6], startdate[6:8], startdate[8:10], startdate[10:12], startdate[12:14])
+	start = datetime.datetime.strptime(re.sub(r'\..*Z', '', startdate), '%Y-%m-%dT%H:%M:%S')
+	if start.timestamp() > datetime.datetime.utcnow().timestamp():
+		logging.debug('program start {} is in the future'.format(startdate))
+
+		logging.debug('Looking for XMLTV channel number that matches XMLTV channel_id {}'.format(programme.attrib['channel']))
+		channel = ''
+		for dname in root.findall("./channel[@id='{}']/display-name".format(programme.attrib['channel'])):
+			try:
+				channel = int(dname.text)
+			except:
+				pass
+		if channel != '':
+			logging.debug('XMLTV channel_id {} -> XMLTV channel number {}'.format(programme.attrib['channel'], channel))
+		else:
+			logging.critical('Cannot find a XMLTV channel number that matches XMLTV channel_id {}'.format(programme.attrib['channel']))
+			return False
+
+		logging.debug('Looking for Jellyfin channel_id that matches XMLTV channel number {}'.format(channel))
+		channel_id = ''
+		for ch in channel_list:
+			if ch['Number'] == str(channel):
+				channel_id = ch['Id']
+		if channel_id != '':
+			logging.debug('XMLTV channel number {} -> Jellyfin channel_id {}'.format(channel, channel_id))
+		else:
+			logging.critical('Cannot find a Jellyfin channel_id that matches XMLTV channel number {}'.format(channel))
+			return False
+				
+		logging.debug('Searching Jellyfin program_guide for program with channel_id {} and starttime {}'.format(channel_id, startdate))
+		for program in program_guide:
+			if program['ChannelId'] == channel_id and program['StartDate'] == startdate:
+
+				#  Check to see if there is already a pending timer or existing recording
+				logging.info('Checking matching program "{}" on channel "{}" starting at "{}" and ending at "{}"'.format(program['Name'], channel, program['StartDate'], program['EndDate']))
+				logging.info('Checking to see it it is already scheduled to be recorded')
+				for timer in existing_timers:
+					logging.debug('Comparing to existing timer: "{}", "{}", "{}", "{}"'.format(timer['ProgramInfo']['Name'], timer['ChannelId'], timer['StartDate'], timer['EndDate']))
+					if timer['ProgramInfo']['Name'] == program['Name'] and timer['ChannelId'] == program['ChannelId'] and timer['StartDate'] == program['StartDate'] and timer['EndDate'] == program['EndDate']:
+						logging.info('It is already scheduled to be recorded, skipping this program')
+						return False
+				logging.info('Checking to see if it has already been recorded')
+				for recording in existing_recordings:
+					logging.debug('Comparing to exisiting recording: "{}", "{}", "{}"'.format(recording['SeriesName'], recording['Name'], recording['Overview']))
+					if recording['SeriesName'] == program['Name'] and recording['Name'] == program['EpisodeTitle'] and recording['Overview'] == program['Overview']:
+						logging.info('It has already been recorded, skipping this program')
+						return False  
+					
+				logging.info('Submitting request to record "{}" on channel {} starting at "{}" and ending at "{}"'.format(program['Name'], program['ChannelId'], program['StartDate'], program['EndDate']))
+
+				#  Get a recording template for this program
+				logging.debug('Getting a recording template for this program')
+				response = requests.get('{}/LiveTV/Timers/Defaults?programID={}'.format(server_url, program['Id']), headers=headers)
+				if response.status_code != 200:
+					logging.critical('Failed to get the recording template with status code {} - {}'.format(response.status_code, response.text))
+					raise Exception('Jellyfin HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+				recording_template = response.json()
+				logging.debug('recording_template = {}'.format(recording_template))
+
+				#  Create a recording timer for this program
+				logging.debug('Creating recording timer')
+				response = requests.post('{}/LiveTV/Timers'.format(server_url), json=recording_template, headers=headers)
+				if response.status_code != 204:
+					logging.critical('Failed to create the timer with status code {} - {}'.format(response.status_code, response.text))
+					raise Exception('Jellyfin HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+				logging.debug('timer response = {} {}'.format(response.status_code, response.text))
+				
+				return True
+				
+		logging.debug('Unable to find a matching program in the Jellyfin program_guide')
+		return False
+	else:
+		logging.debug('Program start time has already passed, will not record.')
+		return False
+
+#  Write JSON data into a log file in the temporary directory.  This is called
+#  for each data request made to Jellyfin if we are logging at the DEBUG level.		
+def logResponseData(name, data):
+	tmpfn = os.path.join(tempfile.gettempdir(), '{}.{}.log'.format(os.path.splitext(os.path.basename(__file__))[0], name))
+	logging.debug('{} data logged in file {}'.format(name, tmpfn))
+	with open(tmpfn, 'w') as f:
+		print(json.dumps(data, indent=4), file=f)
+
+#********************************************************************************
+#                                    M a i n                                    *
+#********************************************************************************
+
+logging.info('Authenticating with Jellyfin server')
+headers = {
+	'Content-Type': 'application/json',
+	'X-Emby-Authorization': 'MediaBrowser Client="Jellyfin Web", Device="keywordRecording", DeviceId="xxx", Version="0.0.1"'
+}
+body = {
+	'username': userid,
+	'pw': passwd,
+}
+response = requests.post('{}/Users/AuthenticateByName'.format(server_url), headers=headers, json=body)
+if response.status_code == 200 or response.status_code == 204:
+	headers['X-Emby-Authorization'] = '{}, Token={}'.format(headers['X-Emby-Authorization'], response.json()['AccessToken'])
+	user_id = response.json()['User']['Id']    #  Only used on the /LiveTV/Recordings call for existing recordings below
+else:
+	logging.critical('Authentication failed with status code {} - {}'.format(response.status_code, response.text))
+	raise Exception('Jellyfin HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+
+logging.info('Getting list of programs already scheduled for recording.')
+response = requests.get('{}/LiveTV/Timers'.format(server_url), headers=headers)
+if response.status_code != 200:
+	logging.critical('Failed to get list of programs already sceduled for recording with status code {} - {}'.format(response.status_code, response.text))
+	raise Exception('Jellyfin HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+existing_timers = response.json()['Items']
+if logging.root.level >= logging.DEBUG:
+	logResponseData('existing_timers', existing_timers)
+
+logging.info('Getting list of existing recordings.')
+response = requests.get('{}/LiveTV/Recordings?userid={}&fields=Overview'.format(server_url, user_id), headers=headers)
+if response.status_code != 200:
+	logging.critical('Failed to get list of existing recordings with status code {} - {}'.format(response.status_code, response.text))
+	raise Exception('Jellyfin HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+existing_recordings = response.json()['Items']
+if logging.root.level >= logging.DEBUG:
+	logResponseData('existing_recordings', existing_recordings)
+
+logging.info('Getting Program Guide data.')
+response = requests.get('{}/LiveTV/Programs?fields=Overview,ProviderIds,People'.format(server_url), headers=headers)
+if response.status_code != 200:
+	logging.critical('Failed to get Program Guide data with status code {} - {}'.format(response.status_code, response.text))
+	raise Exception('Jellyfin HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+program_guide = response.json()['Items']
+if logging.root.level >= logging.DEBUG:
+	logResponseData('program_guide', program_guide)
+
+logging.info('Getting channel mappings from Jellyfin')
+response = requests.get('{}/LiveTV/Channels'.format(server_url), headers=headers)
+if response.status_code != 200:
+	logging.critical('Failed to get the list of channels with status code {} - {}'.format(response.status_code, response.text))
+	raise Exception('Jellyfin HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+channel_list = response.json()['Items']
+logging.debug('channel_list = {}'.format(channel_list))
+if logging.root.level >= logging.DEBUG:
+	logResponseData('channel_list', channel_list)
+
+logging.info('Reading XMLTV schedule from {}'.format(xmltv_file))
+xmltv_schedule = etree.parse(xmltv_file)
+
+logging.info('Searching XMLTV schedule for programs that match the list of regular expressions.')
+root = xmltv_schedule.getroot()
+for programme in root.findall('./programme'):
+	recorded = False
+
+	#  Record if title, sub-title or description match any of the search strings
+	for expression in searches:
+		exp = re.compile(expression, flags=re.IGNORECASE)
+		if exp.search(programme.findtext('title', default='')):
+			logging.info('{} at {} matched expression {}'.format(programme.findtext('title'), programme.attrib['start'], expression))
+			recorded = recordProgramme(root, channel_list, program_guide, programme)
+		elif exp.search(programme.findtext('sub-title', default='')):
+			logging.info('{} at {} matched expression {} in the subtitle.'.format(programme.findtext('title'), programme.attrib['start'], expression))
+			recorded = recordProgramme(root, channel_list, program_guide, programme)
+		elif exp.search(programme.findtext('desc', default='')):
+			logging.info('{} at {} matched expression {} in the description.'.format(programme.findtext('title'), programme.attrib['start'], expression))
+			recorded = recordProgramme(root, channel_list, program_guide, programme)
+			
+	#  Record if any of the names in the credits matches a search string
+	if not recorded:
+		for credits in programme.findall('./credits'):
+			for person in credits:
+				for expression in searches:
+					exp = re.compile(expression, flags=re.IGNORECASE)
+					if exp.search(person.text):
+						logging.info('{} at {} matched expression {} in the credits'.format(programme.findtext('title', default=''), programme.attrib['start'], expression))
+						recordProgramme(root, channel_list, program_guide, programme)
+
+#  End Jellyfin session/logout
+logging.info('Performing logout')
+response = requests.post('{}/Sessions/Logout'.format(server_url), headers=headers)
+if response.status_code != 204:
+	logging.critical('Logout failed with status code {} - {}'.format(response.status_code, response.text))
+	raise Exception('Jellyfin HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+logging.info('Done')

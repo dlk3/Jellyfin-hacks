@@ -1,0 +1,103 @@
+#!/usr/bin/env python
+
+#  This script builds an XMLTV configuration file by matching SchedulesDirect
+#  channels to the cable channel "favorites" list from a HDHomerun tuner.
+
+import requests
+import logging
+import json
+import hashlib
+import xml.etree.ElementTree as etree
+
+#  Name to use for the output XMLTV configuration file
+config_filename = 'tv_grab_zz_json_channel_lineup.config'
+
+#  Name of file specified within the XMLTV config file to be used for caching by 
+#  the tv_grab_zz_json grabber script when it runs
+cache_filename = '/opt/xmltv/tv_grab_zz_json.cache'
+
+#  Hostname or IP address of the HDHomerun device used to get list of cable channels
+hdhomerun_hostname = 'hdhomerun.localdomain'
+
+#  SchedulesDirect login and service info that is written into the configuration file
+#  for use by the tv_grab_zz_json grabber.  This information is also used by this script
+#  to get the SchedulesDirect channel lineup.
+sd_username = 'YOUR_SD_USERNAME'
+sd_password = 'YOUR_SD_PASSWORD'
+sd_lineup = 'YOUR_SD_LINEUP_NAME'
+sd_url = 'https://json.schedulesdirect.org/20141201'
+
+#  Directory into which we'll write this script's log file
+logdir = '/opt/xmltv'
+
+#  Control the level of detail that is logged by this script
+log_level = logging.INFO	#  Can be logging.DEBUG, logging.INFO or logging.CRITICAL
+
+#  Use this line to log to the console
+logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=log_level)
+
+#  Use these lines to log to a file
+#logfile = '{}.log'.format(os.path.join(logdir, os.path.splitext(os.path.basename(sys.argv[0]))[0]))
+#logging.basicConfig(filename=logfile, format='%(asctime)s %(levelname)s: %(message)s', level=log_level)
+
+#  Start by getting an authorization token from SchedulesDirect using the
+#  userid and password supplied above
+logging.info('Login to SchedulesDirect.')
+sd_headers = {
+	'Content-Type': 'application/json',
+	'User-Agent': 'Fetching channel lineup'
+}
+body = {
+	'username': sd_username,
+	'password': hashlib.sha1(sd_password.encode('utf-8')).hexdigest()
+}
+response = requests.post('{}/token'.format(sd_url), json=body, headers=sd_headers)
+if response.status_code != 200:
+	raise Exception('Schedules Direct HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+if response.json()['code'] != 0:
+	logging.critical('SchedulesDirect is not available, please wait at least one hour before trying again')
+	raise Exception('SchedulesDirect reports itself as being unavailable')
+sd_headers['token'] = response.json()['token']
+sd_headers['Accept-Encoding'] = 'deflate,gzip'
+logging.debug('provider[\'token\'] = {}'.format(sd_headers['token']))
+
+logging.info('Checking SchedulesDirect system status.')
+response = requests.get('{}/status'.format(sd_url), headers=sd_headers)
+if response.status_code != 200:
+	raise Exception('SchedulesDirect HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+if response.json()['systemStatus'][0]['status'] != 'Online':
+	logging.critical('SchedulesDirect reports itself as being "{}", please wait at least one hour before trying again'.format(response.json()['systemStatus'][0]['status']))
+	raise Exception('SchedulesDirect reports itself as being "{}"'.format(response.json()['systemStatus'][0]['status']))
+
+logging.info('Getting the channel lineup from SchedulesDirect.')
+response = requests.get('{}/lineups/{}'.format(sd_url, sd_lineup), headers=sd_headers)
+if response.status_code != 200:
+	raise Exception('SchedulesDirect HTTP Status Code = {} - {}'.format(response.status_code, response.text))
+channel_map = {}
+for channel in response.json()['map']:
+	channel_map[channel['channel']] = channel['stationID']
+
+logging.info('Getting the cable channel (favorites) lineup from the HDHomerun device.')
+hdhr_headers = {
+	'Content-Type': 'application/json',
+}
+response = requests.get('http://{}/lineup.json'.format(hdhomerun_hostname), headers=hdhr_headers)
+if response.status_code != 200:
+	logging.critical('Failed while getting the lineup from the HDHomerun device with status code {} - {}'.format(response.status_code, response.text))
+	raise Exception('HDHomerun Status Code = {} - {}'.format(response.status_code, response.text))
+hdhr_lineup = response.json()
+
+logging.info('Writing the XMLTV configuration file, {}'.format(config_filename))
+with open(config_filename, 'w') as f:
+	print('cache={}'.format(cache_filename), file=f)
+	print('channel-id-format=default', file=f)
+	print('previously-shown-format=date', file=f)
+	print('username={}'.format(sd_username), file=f)
+	print('password={}'.format(sd_password), file=f)
+	print('mode=channels', file=f)
+	print('channels={}'.format(sd_lineup), file=f)
+	for channel in hdhr_lineup:
+		if channel['GuideNumber'] in channel_map:
+			print('channel={}'.format(channel_map[channel['GuideNumber']]), file=f)
+		else:
+			logging.warning('Unable to find channel () in Schedules Direct lineup'.format(channel['GuideNumber']))
