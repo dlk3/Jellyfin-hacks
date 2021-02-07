@@ -1,6 +1,6 @@
 # keywordSearch
 
-This script searches the TV guide data file that a XMLTV grabber generates for program titles, subtitles,  descriptions, or cast/crew names that match a collection of search strings.  When it finds a match it sends a request to Jellyfin asking that it create a timer that will record the program.  Jellyfin must be using XMLTV as its TV guide program data provider and the keywordSearch script must reference the same XMLTV file or URL that Jellyfin does.> Live TV.
+This script searches the TV guide data file that a XMLTV grabber generates for program titles, subtitles,  descriptions, or cast/crew names that match a collection of search strings.  When it finds a match it sends a request to Jellyfin asking that it create a timer that will record the program.  Jellyfin must be using XMLTV as its TV guide program data provider and the keywordSearch script must reference the same XMLTV file or URL that Jellyfin does.
 
 ## Installation
 
