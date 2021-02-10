@@ -21,7 +21,7 @@ logdir = '/var/log/jellyfin'
 #  valid SQLAlchemy "create_engine" URL to connect to the database engine of your
 #  choice.  See https://docs.sqlalchemy.org/en/13/core/engines.html#sqlalchemy.create_engine
 #  for additional details.
-db_url = 'mysql://jellyfin_recording_memory:thHz6LWypDcgQBdw@mythtv.localdomain/jellyfin_recording_memory'
+db_url = 'mysql://<SQL_USERID>:<SQL_PASSWORD>@<SQL_SERVER>/<SQL_DATABASE>'
 
 #  This function adds a record to a database for every file that has been
 #  postprocessed.  This gives my keywordRecording script a database it can check
