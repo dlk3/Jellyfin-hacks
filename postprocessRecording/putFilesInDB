@@ -1,0 +1,95 @@
+#!/usr/bin/env python
+
+#################################################################################
+#  Copyright (C) 2021  David King <dave@daveking.com>
+#
+#  This Source Code Form is subject to the terms of the Mozilla Public
+#  License, v. 2.0. If a copy of the MPL was not distributed with this
+#  file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#################################################################################
+
+import os
+import sys
+import re
+import sqlalchemy
+import hashlib
+
+logdir = '/var/log/jellyfin'
+
+#  I used SQLAlchemy as the database interface so that any database engine it
+#  supports could be used behind this script.  Provision this variable with any
+#  valid SQLAlchemy "create_engine" URL to connect to the database engine of your
+#  choice.  See https://docs.sqlalchemy.org/en/13/core/engines.html#sqlalchemy.create_engine
+#  for additional details.
+db_url = 'mysql://jellyfin_recording_memory:thHz6LWypDcgQBdw@mythtv.localdomain/jellyfin_recording_memory'
+
+#  This function adds a record to a database for every file that has been
+#  postprocessed.  This gives my keywordRecording script a database it can check
+#  to avoid repeated recordings of the same programs.
+def memorizeRecording(db_url, fn):
+
+	print('Adding "{}" to the recording memory database.'.format(os.path.basename(fn)))
+
+	print('Parsing filename into component parts'.format(fn))
+	title = ''
+	subtitle = ''
+	season = ''
+	episode = ''
+	
+	#  TV shows
+	m = re.fullmatch(r'(.*?) S(\d*)E(\d*) (.*)', os.path.basename(fn))
+	if m:
+		title = m[1]
+		subtitle = os.path.splitext(m[4])[0]
+		season = m[2]
+		episode = m[3]
+	else:
+		# Movies
+		m = re.fullmatch(r'(.*?) [(](\d*)[)].*', os.path.basename(fn))
+		if m:
+			title = m[1]
+			season = m[2]
+	if m:
+		print('Title: "{}"'.format(title))
+		print('Subtitle: "{}"'.format(subtitle))
+		print('Season: "{}"'.format(season))
+		print('Episode: "{}"'.format(episode))
+
+		#  Create a hash of the filename to serve as the program ID
+		memory_id = hashlib.sha1(os.path.basename(fn).encode('utf-8')).hexdigest()
+
+		print('Performing database insert')
+		
+		#  Define database engine, with debugging set to match this script
+		engine = sqlalchemy.create_engine(db_url, echo=False)
+
+		#  Define a table
+		metadata = sqlalchemy.MetaData()
+		memory = sqlalchemy.Table('memory',metadata,
+			sqlalchemy.Column('MemoryId', sqlalchemy.String(50), sqlalchemy.Sequence('MemoryId_index'), primary_key=True),
+			sqlalchemy.Column('Title', sqlalchemy.String(250)),
+			sqlalchemy.Column('Subtitle', sqlalchemy.String(250)),
+			sqlalchemy.Column('Season', sqlalchemy.String(5)),
+			sqlalchemy.Column('Episode', sqlalchemy.String(5))
+		)
+		metadata.create_all(engine)
+		
+		#  Insert a row
+		try:
+			sql = memory.insert().values(MemoryId=memory_id, Title=title, Subtitle=subtitle, Season=season, Episode=episode)
+			with engine.connect() as connection:
+				result = connection.execute(sql)
+			print('Database insert completed successfully.')
+		except Exception as e:
+			print(e)
+			print('Database insert failed, postprocessing continues.')
+		
+	else:
+		print('Unable to parse the input filename.  This recording will not be memorized.')
+			
+			
+for root, dirs, files in os.walk(sys.argv[1]):
+	for fn in files:
+		#parts = os.path.splitext(fn)
+		#fn = 'Anthony Bourdain: ' + parts[0].replace('.720p', '').replace('.', ' ') + parts[1] 
+		memorizeRecording(db_url, fn)

@@ -1,5 +1,11 @@
 #!/usr/bin/env python
 
+#  Copyright (C) 2021  David King <dave@daveking.com>
+#
+#  This Source Code Form is subject to the terms of the Mozilla Public License,
+#  v. 2.0.  If a copy of the MPL was not distbuted with this file, You can
+#  obtain one at https://mozilla.org/MPL/2.0/.
+
 #  This script builds an XMLTV configuration file by matching SchedulesDirect
 #  channels to the cable channel "favorites" list from a HDHomerun tuner.
 

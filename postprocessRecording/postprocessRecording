@@ -5,17 +5,20 @@
 #
 #  This Source Code Form is subject to the terms of the Mozilla Public
 #  License, v. 2.0. If a copy of the MPL was not distributed with this
-#  file, you can obtain one at https://mozilla.org/MPL/2.0/.
+#  file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #################################################################################
-#  Mark the commercials in a Jellyfin Live TV recording file with chapter 
-#  markers and remux it from a *.ts container into a *.mp4 container
-#  without re-encoding the contents.
+#  Create a record of this Jellyfin LiveTV recording in a database.  This allows
+#  other scripts to check to see what LiveTV programs have been recorded in the 
+#  past.
 #
-#  This allows the use of the VLC video player for playback of Live TV 
-#  recordings on the Nvidia SHIELD device.  VLC has much better
-#  fast-forward/rewind capabilities (among other things) than does the
-#  Jellyfin Android TV app's internal video player.  But it can't seek in
-#  a *.ts container.
+#  Mark the commercials in this Jellyfin LiveTV recording file with chapter
+#  markers and remux it from a *.ts container into a *.mp4 container without
+#  re-encoding the contents.
+#
+#  This allows the use of the VLC video player for playback of LiveTV recordings
+#  on the Nvidia SHIELD device.  VLC has much better fast-forward/rewind
+#  capabilities (among other things) than does the Jellyfin Android TV app's
+#  internal video player.  But it can't seek in a *.ts container.
 #################################################################################
 
 import sys
@@ -25,82 +28,169 @@ import subprocess
 import shutil
 import logging
 import multiprocessing
+import re
+import sqlalchemy
+import hashlib
 
 logdir = '/var/log/jellyfin'
 
+#  I used SQLAlchemy as the database interface so that any database engine it
+#  supports could be used behind this script.  Provision this variable with any
+#  valid SQLAlchemy "create_engine" URL to connect to the database engine of your
+#  choice.  See https://docs.sqlalchemy.org/en/13/core/engines.html#sqlalchemy.create_engine
+#  for additional details.
+db_url = 'mysql://<SQL_USERID>:<SQL_PASSWORD>@<SQL_SERVER>/<SQL_DATABASE>'
+
+#  This function adds a record to a database for every file that has been
+#  postprocessed.  This gives my keywordRecording script a database it can check
+#  to avoid repeated recordings of the same programs.
+def memorizeRecording(db_url, fn):
+
+	logging.info('Adding "{}" to the recording memory database.'.format(os.path.basename(fn)))
+
+	logging.info('Parsing filename into component parts'.format(fn))
+	title = ''
+	subtitle = ''
+	season = ''
+	episode = ''
+	
+	#  TV shows
+	m = re.fullmatch(r'(.*?) S(\d*)E(\d*)(.*)', os.path.splitext(os.path.basename(fn))[0])
+	if m:
+		title = m[1]
+		subtitle = m[4].strip()
+		season = m[2]
+		episode = m[3]
+	else:
+		#  TV shows without season and episode
+		m = re.fullmatch(r'(.*?) \d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2} - (.*)', os.path.splitext(os.path.basename(fn))[0])
+		if m:
+			title = m[1]
+			subtitle = m[2].strip()
+		else:
+			# Movies
+			m = re.fullmatch(r'(.*?) [(](\d*)[)].*', os.path.basename(fn))
+			if m:
+				title = m[1]
+				season = m[2]
+	if m:
+		logging.info('Title: "{}"'.format(title))
+		logging.info('Subtitle: "{}"'.format(subtitle))
+		logging.info('Season: "{}"'.format(season))
+		logging.info('Episode: "{}"'.format(episode))
+
+		#  Create a hash of the filename to serve as the program ID
+		memory_id = hashlib.sha1(os.path.basename(fn).encode('utf-8')).hexdigest()
+
+		logging.info('Performing database insert')
+		
+		#  Define database engine, with debugging set to match this script
+		if logging.root.level == logging.DEBUG:
+			engine = sqlalchemy.create_engine(db_url, echo=True)
+		else:
+			engine = sqlalchemy.create_engine(db_url, echo=False)
+
+		#  Create the table, if it does not exist
+		metadata = sqlalchemy.MetaData()
+		memory = sqlalchemy.Table('memory',metadata,
+			sqlalchemy.Column('MemoryId', sqlalchemy.String(50), sqlalchemy.Sequence('MemoryId_index'), primary_key=True),
+			sqlalchemy.Column('Title', sqlalchemy.String(250)),
+			sqlalchemy.Column('Subtitle', sqlalchemy.String(250)),
+			sqlalchemy.Column('Season', sqlalchemy.String(5)),
+			sqlalchemy.Column('Episode', sqlalchemy.String(5))
+		)
+		metadata.create_all(engine)
+		
+		#  Insert a row into the table
+		try:
+			sql = memory.insert().values(MemoryId=memory_id, Title=title, Subtitle=subtitle, Season=season, Episode=episode)
+			with engine.connect() as connection:
+				result = connection.execute(sql)
+			logging.info('Database insert completed successfully.')
+		except Exception as e:
+			logging.warning(e)
+			logging.warning('Database insert failed, postprocessing continues.')
+		
+	else:
+		logging.warning('Unable to parse the input filename.  This recording will not be memorized.')
+			
 #  Log the output of calls made to subprocess.run()
 def log_subout(output):
     for lines in output.decode('utf-8').split('\n'):
         for line in lines.split('\r'):
             logging.debug(line)
-	
+
 #  Jellyfin will pass the recording filename on the command line
 if len(sys.argv) == 2:
-    fn = sys.argv[1]
-    if os.path.exists(fn):
-        logfile = '{}.postprocessing'.format(os.path.join(logdir, os.path.splitext(os.path.basename(fn))[0]))
-        logging.basicConfig(filename=logfile, format='%(asctime)s %(levelname)s: %(message)s', level=logging.DEBUG)
+	fn = sys.argv[1]
+	if os.path.exists(fn):
+		logfile = '{}.postprocessing'.format(os.path.join(logdir, os.path.splitext(os.path.basename(fn))[0]))
+		logging.basicConfig(filename=logfile, format='%(asctime)s %(levelname)s: %(message)s', level=logging.DEBUG)
         
-        #  We use this path for temporary work files
-        tempdir = tempfile.gettempdir()
+		#  We use this path for temporary work files
+		tempdir = tempfile.gettempdir()
         
-        #  Make sure that we have the full path to the source file
-        fn = os.path.abspath(fn)
+		#  Make sure that we have the full path to the source file
+		fn = os.path.abspath(fn)
 
-        #  Commercial flagging -  use the comskip utility to generate a 
-        #  ffmetadata format file containing chapter metadata marking the
-        #  commercials it detects.
-        logging.info('Using comskip to generate chapter marks for commercials in the MP4')
-        try:
-            inifile = '{}.comskip.ini'.format(os.path.join(tempdir, os.path.basename(fn)))
-            with open(inifile, 'w') as ini:
-                print('[Main Settings]', file=ini)
-                print('detect_method=27', file=ini)
-                print('[CPU Load Reduction]', file=ini)
-                print('thread_count={}'.format(round(multiprocessing.cpu_count() / 2)), file=ini)
-                print('[Global Removes]', file=ini)
-                print('delete_show_after_last_commercial=1', file=ini)
-                print('delete_show_before_first_commercial=1', file=ini)
-                print('[Output Control]', file=ini)
-                print('output_default=0', file=ini)
-                print('output_ffmeta=1', file=ini)
-            proc = subprocess.run('comskip --ini="{}" --ts --output="{}" "{}"'.format(inifile, tempdir, fn), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            log_subout(proc.stdout)
-            os.unlink(inifile)
-        except subprocess.CalledProcessError as e:
-            logging.critical(e)
-            log_subout(e.output)
-            exit(e.returncode)
-        ffmetadata = os.path.join(tempdir, '{}.ffmeta'.format(os.path.splitext(os.path.basename(fn))[0]))
-        if not os.path.exists(ffmetadata):
-            logging.critical('ffmetadata file "{}" does not exist'.format(ffmetadata))
-            exit(1)
+		#  Add this recording to the recording memory database
+		memorizeRecording(db_url, fn)
 
-        #  Remux the *.ts as a *.mp4, adding the chapter metadata
-        logging.info('Using ffmpeg to remux the TS file as a MP4 file and to add the chapter markers')
-        outfile = os.path.join(tempdir, '{}.mp4'.format(os.path.splitext(os.path.basename(fn))[0]))
-        try:
-            proc = subprocess.run('ffmpeg -hide_banner -y -i "{}" -i "{}" -map 0 -map_metadata 1 -c copy "{}"'.format(fn, ffmetadata, outfile), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            log_subout(proc.stdout)
-        except subprocess.CalledProcessError as e:
-            logging.critical(e)
-            log_subout(e.output)
-            exit(e.returncode)
+		#  Commercial flagging -  use the comskip utility to generate a 
+		#  ffmetadata format file containing chapter metadata marking the
+		#  commercials it detects.
+		logging.info('Using comskip to generate chapter marks for commercials in the MP4')
+		try:
+			inifile = '{}.comskip.ini'.format(os.path.join(tempdir, os.path.basename(fn)))
+			with open(inifile, 'w') as ini:
+				print('[Main Settings]', file=ini)
+				print('detect_method=27', file=ini)
+				print('[CPU Load Reduction]', file=ini)
+				print('thread_count={}'.format(round(multiprocessing.cpu_count() / 2)), file=ini)
+				print('[Global Removes]', file=ini)
+				print('delete_show_after_last_commercial=1', file=ini)
+				print('delete_show_before_first_commercial=1', file=ini)
+				print('[Output Control]', file=ini)
+				print('output_default=0', file=ini)
+				print('output_ffmeta=1', file=ini)
+			proc = subprocess.run('comskip --ini="{}" --ts --output="{}" "{}"'.format(inifile, tempdir, fn), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+			log_subout(proc.stdout)
+			os.unlink(inifile)
+		except subprocess.CalledProcessError as e:
+			logging.critical(e)
+			log_subout(e.output)
+			exit(e.returncode)
+		ffmetadata = os.path.join(tempdir, '{}.ffmeta'.format(os.path.splitext(os.path.basename(fn))[0]))
+		if not os.path.exists(ffmetadata):
+			logging.critical('ffmetadata file "{}" does not exist'.format(ffmetadata))
+			exit(1)
 
-        #  Replace the *.ts with the *.mp4 and clean up
-        try:
-            logging.info('Replacing the TS file wth the MP4 file')
-            shutil.move(outfile, os.path.split(fn)[0])
-            (head, tail) = os.path.split(fn)
-            shutil.move(fn, os.path.join(head, '.' + tail))
-            os.unlink(ffmetadata)
-        except Exception as e:
-            logging.critical(e)
-            exit(1)
+		#  Remux the *.ts as a *.mp4, adding the chapter metadata
+		logging.info('Using ffmpeg to remux the TS file as a MP4 file and to add the chapter markers')
+		outfile = os.path.join(tempdir, '{}.mp4'.format(os.path.splitext(os.path.basename(fn))[0]))
+		try:
+			proc = subprocess.run('ffmpeg -hide_banner -y -i "{}" -i "{}" -map 0 -map_metadata 1 -c copy "{}"'.format(fn, ffmetadata, outfile), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+			log_subout(proc.stdout)
+		except subprocess.CalledProcessError as e:
+			logging.critical(e)
+			log_subout(e.output)
+			exit(e.returncode)
+		finally:
+			os.unlink(ffmetadata)
 
-    else:
-        print('{} does not exist'.format(fn))
-        exit(1)
+		#  Replace the *.ts with the *.mp4 and clean up
+		try:
+			logging.info('Replacing the TS file wth the MP4 file')
+			shutil.move(outfile, os.path.split(fn)[0])
+			(head, tail) = os.path.split(fn)
+			shutil.move(fn, os.path.join(head, '.' + tail))
+		except Exception as e:
+			logging.critical(e)
+			exit(1)
+
+	else:
+		print('{} does not exist'.format(fn))
+		exit(1)
 else:
-    print('Usage: {} <filename>'.format(sys.argv[0]))
-    exit(1)
+	print('Usage: {} <filename>'.format(sys.argv[0]))
+	exit(1)

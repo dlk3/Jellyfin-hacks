@@ -11,6 +11,12 @@ This script searches the TV guide data file that a XMLTV grabber generates for p
   * The <code>xmltv_file</code> variable needs to be set to the full path of the file that is output by the XMLTV grabber that provides TV guide data to Jellyfin.
     * Obtain the location of the file from <code>Dashboard -> Live TV</code> in jellyfin.
 
+## Dependency On [postprocessRecording](https://github.com/dlk3/Jellyfin-hacks/tree/master/postprocessRecording) Script
+
+It's optional, but one of the checks that keywordSerarch does is to determine if the show it has found in its search has ever been recorded by Jellyfin before.  If it finds that has been, then it skips recording it again.  This search uses a database that is created by my [postprocessRecording](https://github.com/dlk3/Jellyfin-hacks/tree/master/postprocessRecording) script.  Wheneve it post-processes a recording file it records information about that file into a database table.  keywordRecording can then use that same database table to lookup programs that it has found while searching the program guide.
+
+If postprocessRecording isn't being used, i.e., the database table it would have created does not exist, then keywordRecording ignores this check.
+
 ## Use
 
 The script should be scheduled to run regularly, probably once a day, using cron, a systemd timer, or some other similar facility.  Be sure to check file permissions to ensure that the userid under which the script runs has read access to the XMLTV output file and write access to the directory where the script will write its log file, as specified in the configuration section at the top of the script.

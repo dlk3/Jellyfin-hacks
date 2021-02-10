@@ -1,0 +1,19 @@
+#!/usr/bin/env python
+
+#  Clean out any backup files, i.e. hidden *.ts files, that were created by the
+#  postprocessRecordings script after a recording, i.e., the corresponding *.mp4
+#  file, has been deleted through the Jellyfin UI.
+
+import os
+
+recordings_dir = '/raidarray/Jellyfin Recordings'
+
+for root, dirs, files in os.walk(recordings_dir):
+    for file in files:
+        #  Look at every hidden *.ts file
+        if file.startswith('.') and file.endswith('.ts'):
+            #  If there isn't a corresponding *.mp4 file that is not 
+            #  hidden, then delete the hidden file
+            mp4fn = '{}.mp4'.format(os.path.splitext(os.path.basename(file.lstrip('.')))[0])
+            if not os.path.exists(os.path.join(root, mp4fn)):
+                os.unlink(os.path.join(root, file))

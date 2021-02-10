@@ -26,24 +26,35 @@ import os
 #  See https://docs.python.org/3/library/re.html for details.
 #  Case is always ignored for these searches. 
 searches = [
-	'Stevie Ray Vaughan',           #  Match this 
-	'(?=.*Anthony)(?=.*Bourdain)(?!.*No Reservations)',  #  Match first and last names in a string, in any order, as long as the string does not contain "No Reservations"
-	'(?=.*David)(?=.*Attenborough)',
-	'(?=.*Jeremy)(?=.*Clarkson)'
+	'Stevie Ray Vaughan',               
+	'(?=.*David)(?=.*Attenborough)',   
+	'(?=.*Jeremy)(?=.*Clarkson)',
+	'(?=.*Lucy)(?=.*Worsley)',
+	'(?=.*Anthony)(?=.*Bourdain)(?!.*No Reservations)'
 ]
 
 #  Scheduling recordings requires Jellyfin user authentication, api-key authentication isn't sufficient
 server_url = 'http://localhost:8096/emby'
-userid = 'YOUR_JELLYFIN_USERID'
-passwd = 'YOUR_JELLYFIN_PASSWORD'
+userid = '<JELLYFIN_USERID>'
+passwd = '<JELLYFIN_PASSWDRD'
 #  WARNING: These values are sent in the clear.  Either run this script locally on the
 #  Jellyfin server or use an HTTPS URL to connect to the Jellyfin server.
+
+#  File where we can find the latest output from the XMLTV grabber
+xmltv_file  = '/opt/xmltv/xmltv_output.xml'
+
+#  I used SQLAlchemy as the database interface so that any database engine it
+#  supports could be used behind this script.  Provision this variable with any
+#  valid SQLAlchemy "create_engine" URL to connect to the database engine of your
+#  choice.  See https://docs.sqlalchemy.org/en/13/core/engines.html#sqlalchemy.create_engine
+#  for additional details.
+db_url = 'mysql://<SQL_USERID>:<SQL_PASSWORD>@<SQL_SERVER>/<SQL_DATABASE>'
 
 #  Directory into which we will write our log file
 logdir = '/var/log/jellyfin'
 
 #  Control the level of detail that is logged
-log_level = logging.INFO	#  Can be logging.DEBUG, logging.INFO or logging.CRITICAL
+log_level = logging.DEBUG	#  Can be logging.DEBUG, logging.INFO or logging.CRITICAL
 
 #  Use this line to log to the console
 #logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=log_level)
@@ -51,9 +62,6 @@ log_level = logging.INFO	#  Can be logging.DEBUG, logging.INFO or logging.CRITIC
 #  Use these lines to log to a file
 logfile = '{}.log'.format(os.path.join(logdir, os.path.splitext(os.path.basename(__file__))[0]))
 logging.basicConfig(filename=logfile, format='%(asctime)s %(levelname)s: %(message)s', level=log_level)
-
-#  File where we can find the latest output from the XMLTV grabber
-xmltv_file  = '/opt/xmltv/xmltv_output.xml'
 
 #********************************************************************************
 #                               F u n c t i o n s                               *
@@ -66,6 +74,7 @@ import tempfile
 import hashlib
 import json
 import re
+import sqlalchemy
 
 #  Once a program has been found in the XMLTV schedule that matches one of the
 #  regular expressions above, this routine will try to schedule that program to
@@ -124,6 +133,10 @@ def recordProgramme(root, channel_list, program_guide, programme):
 					if recording['SeriesName'] == program['Name'] and recording['Name'] == program['EpisodeTitle'] and recording['Overview'] == program['Overview']:
 						logging.info('It has already been recorded, skipping this program')
 						return False  
+				logging.info('Check to see if this program has ever been recorded before.')
+				if previouslyRecorded(db_url, program):
+					logging.info('This program is in the recording memory database, skipping it.')
+					return False  
 					
 				logging.info('Submitting request to record "{}" on channel {} starting at "{}" and ending at "{}"'.format(program['Name'], program['ChannelId'], program['StartDate'], program['EndDate']))
 
@@ -152,6 +165,57 @@ def recordProgramme(root, channel_list, program_guide, programme):
 		logging.debug('Program start time has already passed, will not record.')
 		return False
 
+#  Search for this program in the recording memory database created by my
+#  postprocessRecording script to see if it has ever been recorded before.
+def previouslyRecorded(db_url, program):
+
+	title = ''
+	if 'Name' in program:
+		title = program['Name']
+	subtitle = ''
+	season = ''
+	episode = ''
+	if 'ParentIndexNumber' in program:
+		season = str(program['ParentIndexNumber']).zfill(2)
+		if 'IndexNumber' in program:
+			episode = str(program['IndexNumber']).zfill(2)
+	elif 'IsMovie' in program and program['IsMovie']:
+		season = program['ProductionYear']
+	else:
+		if 'EpisodeTitle' in program:
+			subtitle = program['EpisodeTitle']
+	
+	logging.info('Performing database query for this program:')
+	logging.info('Title: "{}"'.format(title))
+	logging.info('Subtitle: "{}"'.format(subtitle))
+	logging.info('Season: "{}"'.format(season))
+	logging.info('Episode: "{}"'.format(episode))
+	
+	#  Define database engine, with debugging set to match this script
+	if logging.root.level == logging.DEBUG:
+		engine = sqlalchemy.create_engine(db_url, echo=True)
+	else:
+		engine = sqlalchemy.create_engine(db_url, echo=False)
+
+	#  Database query
+	try:
+		if subtitle == '':
+			sql = sqlalchemy.sql.text('SELECT * FROM `memory` WHERE Title LIKE "{}" AND Season = "{}" AND Episode = "{}"'.format(title, season, episode))
+		else:
+			sql = sqlalchemy.sql.text('SELECT * FROM `memory` WHERE Title LIKE "{}" AND Subtitle LIKE "{}" AND Season = "{}" AND Episode = "{}"'.format(title, subtitle, season, episode))
+		with engine.connect() as connection:
+			result = connection.execute(sql).fetchall()
+			if len(result) > 0:
+				logging.info('Program found in database.')
+				return True
+	except Exception as e:
+		logging.warning(e)
+		logging.warning('Database query failed')
+	
+	logging.info('Program not found in database.')
+	
+	return False
+	
 #  Write JSON data into a log file in the temporary directory.  This is called
 #  for each data request made to Jellyfin if we are logging at the DEBUG level.		
 def logResponseData(name, data):
@@ -214,7 +278,6 @@ if response.status_code != 200:
 	logging.critical('Failed to get the list of channels with status code {} - {}'.format(response.status_code, response.text))
 	raise Exception('Jellyfin HTTP Status Code = {} - {}'.format(response.status_code, response.text))
 channel_list = response.json()['Items']
-logging.debug('channel_list = {}'.format(channel_list))
 if logging.root.level >= logging.DEBUG:
 	logResponseData('channel_list', channel_list)
 
