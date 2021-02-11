@@ -39,7 +39,7 @@ logdir = '/var/log/jellyfin'
 #  valid SQLAlchemy "create_engine" URL to connect to the database engine of your
 #  choice.  See https://docs.sqlalchemy.org/en/13/core/engines.html#sqlalchemy.create_engine
 #  for additional details.
-db_url = 'mysql://<SQL_USERID>:<SQL_PASSWORD>@<SQL_SERVER>/<SQL_DATABASE>'
+db_url = 'mysql://<MYSQL_USERID>:<MYSQL_PASSWORD>@<MYSQL_SERVER_HOSTNAME>/<MYSQL_DATABASE_NAME>'
 
 #  This function adds a record to a database for every file that has been
 #  postprocessed.  This gives my keywordRecording script a database it can check
@@ -155,28 +155,32 @@ if len(sys.argv) == 2:
 				print('output_ffmeta=1', file=ini)
 			proc = subprocess.run('comskip --ini="{}" --ts --output="{}" "{}"'.format(inifile, tempdir, fn), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 			log_subout(proc.stdout)
-			os.unlink(inifile)
 		except subprocess.CalledProcessError as e:
-			logging.critical(e)
 			log_subout(e.output)
-			exit(e.returncode)
-		ffmetadata = os.path.join(tempdir, '{}.ffmeta'.format(os.path.splitext(os.path.basename(fn))[0]))
-		if not os.path.exists(ffmetadata):
-			logging.critical('ffmetadata file "{}" does not exist'.format(ffmetadata))
-			exit(1)
+			logging.critical(e)
+		finally:
+			if os.path.exists(inifile):
+				os.unlink(inifile)
 
 		#  Remux the *.ts as a *.mp4, adding the chapter metadata
-		logging.info('Using ffmpeg to remux the TS file as a MP4 file and to add the chapter markers')
+		ffmetadata = os.path.join(tempdir, '{}.ffmeta'.format(os.path.splitext(os.path.basename(fn))[0]))
 		outfile = os.path.join(tempdir, '{}.mp4'.format(os.path.splitext(os.path.basename(fn))[0]))
 		try:
-			proc = subprocess.run('ffmpeg -hide_banner -y -i "{}" -i "{}" -map 0 -map_metadata 1 -c copy "{}"'.format(fn, ffmetadata, outfile), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+			if os.path.exists(ffmetadata):
+				logging.info('Using ffmpeg to remux the TS file as a MP4 file and to add the chapter markers')
+				proc = subprocess.run('ffmpeg -hide_banner -y -i "{}" -i "{}" -map 0 -map_metadata 1 -c copy "{}"'.format(fn, ffmetadata, outfile), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+			else:
+				logging.critical('ffmetadata file "{}" does not exist'.format(ffmetadata))
+				logging.info('Using ffmpeg to remux the TS file as a MP4 file without any chapter markers')
+				proc = subprocess.run('ffmpeg -hide_banner -y -i "{}" -c copy "{}"'.format(fn, outfile), shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 			log_subout(proc.stdout)
 		except subprocess.CalledProcessError as e:
-			logging.critical(e)
 			log_subout(e.output)
+			logging.critical(e)
 			exit(e.returncode)
 		finally:
-			os.unlink(ffmetadata)
+			if os.path.exists(ffmetadata):
+				os.unlink(ffmetadata)
 
 		#  Replace the *.ts with the *.mp4 and clean up
 		try:
